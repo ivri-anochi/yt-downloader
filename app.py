@@ -5,8 +5,11 @@ ffmpeg/ffprobe are picked up automatically if they sit next to the program.
 """
 import os
 import queue
+import shutil
+import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
@@ -20,6 +23,7 @@ APP_DIR = (
 
 COOKIES_FILE = os.path.join(os.path.expanduser("~"), ".ytdl-gui", "cookies.txt")
 BROWSERS = ["chrome", "edge", "firefox", "brave", "opera"]
+BROWSER_EXES = {"chrome": "chrome.exe", "edge": "msedge.exe", "brave": "brave.exe", "opera": "opera.exe"}
 
 QUALITIES = {
     "Best video (MP4)": {
@@ -58,6 +62,7 @@ class Cancelled(Exception):
 class QueueLogger:
     def __init__(self, q):
         self.q = q
+        self.errors = 0
 
     def debug(self, msg):
         if not msg.startswith("[debug]"):
@@ -70,7 +75,8 @@ class QueueLogger:
         self.q.put(("log", "WARNING: " + msg))
 
     def error(self, msg):
-        self.q.put(("log", "ERROR: " + msg))
+        self.errors += 1
+        self.q.put(("log", "ERROR: " + msg.replace("ERROR: ", "")))
 
 
 class App(tk.Tk):
@@ -152,6 +158,11 @@ class App(tk.Tk):
         ttk.Checkbutton(
             row, text="Use exported cookies when downloading", variable=self.use_cookies
         ).pack(side="left", padx=6)
+
+        row = ttk.Frame(main)
+        row.pack(fill="x", **pad)
+        ttk.Button(row, text="Load cookies.txt file...", command=self._load_cookies_file).pack(side="left")
+        ttk.Label(row, text="(fallback if browser export fails)").pack(side="left", padx=6)
 
         row = ttk.Frame(main)
         row.pack(fill="x", **pad)
@@ -256,6 +267,7 @@ class App(tk.Tk):
             elif d["status"] == "finished":
                 self.q.put(("progress", 100, "Processing..."))
 
+        logger = QueueLogger(self.q)
         if subfolders:
             template = "%(playlist_title|Single videos)s/%(title)s [%(id)s].%(ext)s"
         else:
@@ -265,7 +277,7 @@ class App(tk.Tk):
             "outtmpl": template,
             "paths": {"home": outdir},
             "progress_hooks": [hook],
-            "logger": QueueLogger(self.q),
+            "logger": logger,
             "ignoreerrors": True,
             "windowsfilenames": True,
             "retries": 10,
@@ -284,10 +296,19 @@ class App(tk.Tk):
         if os.path.exists(os.path.join(APP_DIR, ffmpeg_name)):
             opts["ffmpeg_location"] = APP_DIR
 
+        # YouTube needs a JavaScript runtime (deno) to solve its challenges
+        deno_path = os.path.join(APP_DIR, "deno.exe" if os.name == "nt" else "deno")
+        if os.path.exists(deno_path):
+            opts["js_runtimes"] = {"deno": {"path": deno_path}}
+        opts["remote_components"] = ["ejs:github"]
+
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download(urls)
-            self.q.put(("done", "Finished"))
+            if logger.errors:
+                self.q.put(("done", f"Finished with {logger.errors} error(s) - see log"))
+            else:
+                self.q.put(("done", "Finished"))
         except Cancelled:
             self.q.put(("done", "Cancelled"))
         except Exception as e:  # noqa: BLE001
@@ -296,12 +317,29 @@ class App(tk.Tk):
 
     def _export_cookies(self):
         browser = self.browser.get()
+        close_first = False
+        if os.name == "nt" and browser in BROWSER_EXES:
+            close_first = messagebox.askyesno(
+                "Close browser?",
+                f"{browser} must be fully closed to read its cookies.\n\n"
+                "Close it now automatically? (Tabs are usually restored when you reopen it.)",
+            )
         self.btn_cookies.configure(state="disabled")
-        self._log(f"Exporting cookies from {browser}... (if it fails, close the browser and retry)")
-        threading.Thread(target=self._export_cookies_worker, args=(browser,), daemon=True).start()
+        self._log(f"Exporting cookies from {browser}...")
+        threading.Thread(
+            target=self._export_cookies_worker, args=(browser, close_first), daemon=True
+        ).start()
 
-    def _export_cookies_worker(self, browser):
+    def _export_cookies_worker(self, browser, close_first):
         try:
+            if close_first:
+                self.q.put(("log", f"Closing {browser}..."))
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", BROWSER_EXES[browser]],
+                    capture_output=True,
+                    creationflags=0x08000000,  # no console window
+                )
+                time.sleep(2)
             os.makedirs(os.path.dirname(COOKIES_FILE), exist_ok=True)
             opts = {"cookiesfrombrowser": (browser,), "quiet": True, "logger": QueueLogger(self.q)}
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -309,7 +347,32 @@ class App(tk.Tk):
                 count = len(ydl.cookiejar)
             self.q.put(("cookies_ok", count))
         except Exception as e:  # noqa: BLE001
-            self.q.put(("cookies_fail", str(e)))
+            msg = str(e)
+            low = msg.lower()
+            if "copy" in low or "decrypt" in low or "dpapi" in low:
+                msg += (
+                    "\nHint: recent Chrome versions block cookie access. Try Firefox or Edge in the"
+                    " list, or export cookies.txt with a browser extension and use"
+                    " 'Load cookies.txt file...'."
+                )
+            self.q.put(("cookies_fail", msg))
+
+    def _load_cookies_file(self):
+        path = filedialog.askopenfilename(
+            title="Choose cookies.txt (Netscape format)",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(COOKIES_FILE), exist_ok=True)
+            shutil.copyfile(path, COOKIES_FILE)
+        except OSError as e:
+            self._log(f"ERROR loading cookies file: {e}")
+            return
+        self.use_cookies.set(True)
+        self._log(f"Loaded cookies file: {path}")
+        self.status.set("Cookies loaded")
 
     # ---------- queue polling ----------
     def _poll(self):
