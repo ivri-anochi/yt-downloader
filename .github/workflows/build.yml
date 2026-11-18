@@ -29,7 +29,7 @@ jobs:
           pip install pyinstaller
 
       - name: Build exe
-        run: pyinstaller --noconfirm --onefile --windowed --name YTDownloader --collect-all yt_dlp app.py
+        run: pyinstaller --noconfirm --onefile --windowed --name YTDownloader --collect-all yt_dlp --collect-all yt_dlp_ejs app.py
 
       - name: Download ffmpeg
         shell: pwsh
@@ -40,11 +40,18 @@ jobs:
           Copy-Item "$($bin.FullName)\ffmpeg.exe" dist\
           Copy-Item "$($bin.FullName)\ffprobe.exe" dist\
 
+      - name: Download deno (JavaScript runtime for YouTube)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" -OutFile deno.zip
+          Expand-Archive deno.zip -DestinationPath deno_tmp
+          Copy-Item deno_tmp\deno.exe dist\
+
       - name: Create ZIP
         shell: pwsh
         run: |
           Copy-Item README.md dist\README.md
-          Compress-Archive -Path dist\YTDownloader.exe, dist\ffmpeg.exe, dist\ffprobe.exe, dist\README.md -DestinationPath YTDownloader-windows.zip
+          Compress-Archive -Path dist\YTDownloader.exe, dist\ffmpeg.exe, dist\ffprobe.exe, dist\deno.exe, dist\README.md -DestinationPath YTDownloader-windows.zip
 
       - uses: actions/upload-artifact@v4
         with:
