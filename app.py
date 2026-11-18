@@ -18,6 +18,9 @@ APP_DIR = (
     else os.path.dirname(os.path.abspath(__file__))
 )
 
+COOKIES_FILE = os.path.join(os.path.expanduser("~"), ".ytdl-gui", "cookies.txt")
+BROWSERS = ["chrome", "edge", "firefox", "brave", "opera"]
+
 QUALITIES = {
     "Best video (MP4)": {
         "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
@@ -85,6 +88,8 @@ class App(tk.Tk):
         self.quality = tk.StringVar(value=list(QUALITIES)[0])
         self.subfolders = tk.BooleanVar(value=True)
         self.use_archive = tk.BooleanVar(value=True)
+        self.browser = tk.StringVar(value="chrome")
+        self.use_cookies = tk.BooleanVar(value=os.path.exists(COOKIES_FILE))
 
         self._build_ui()
         self.after(100, self._poll)
@@ -101,6 +106,11 @@ class App(tk.Tk):
         ).pack(anchor="w", **pad)
         self.urls = scrolledtext.ScrolledText(main, height=6, wrap="none")
         self.urls.pack(fill="x", **pad)
+
+        row = ttk.Frame(main)
+        row.pack(fill="x", **pad)
+        ttk.Button(row, text="Paste from clipboard", command=self._paste).pack(side="left")
+        ttk.Button(row, text="Clear", command=self._clear_urls).pack(side="left", padx=6)
 
         row = ttk.Frame(main)
         row.pack(fill="x", **pad)
@@ -132,6 +142,19 @@ class App(tk.Tk):
 
         row = ttk.Frame(main)
         row.pack(fill="x", **pad)
+        self.btn_cookies = ttk.Button(
+            row, text="Export cookies from browser", command=self._export_cookies
+        )
+        self.btn_cookies.pack(side="left")
+        ttk.Combobox(
+            row, textvariable=self.browser, values=BROWSERS, state="readonly", width=9
+        ).pack(side="left", padx=6)
+        ttk.Checkbutton(
+            row, text="Use exported cookies when downloading", variable=self.use_cookies
+        ).pack(side="left", padx=6)
+
+        row = ttk.Frame(main)
+        row.pack(fill="x", **pad)
         self.btn_start = ttk.Button(row, text="Download", command=self._start)
         self.btn_start.pack(side="left")
         self.btn_cancel = ttk.Button(row, text="Cancel", command=self._cancel, state="disabled")
@@ -146,6 +169,26 @@ class App(tk.Tk):
         self.log.pack(fill="both", expand=True, **pad)
 
         self._log("Tip: for a channel, paste e.g. https://www.youtube.com/@name/videos")
+
+    def _paste(self):
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            self.status.set("Clipboard is empty or has no text")
+            return
+        links = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not links:
+            self.status.set("Clipboard is empty or has no text")
+            return
+        existing = self.urls.get("1.0", "end").strip()
+        if existing:
+            self.urls.insert("end", "\n")
+        self.urls.insert("end", "\n".join(links) + "\n")
+        self.urls.see("end")
+        self.status.set(f"Pasted {len(links)} link(s)")
+
+    def _clear_urls(self):
+        self.urls.delete("1.0", "end")
 
     def _browse(self):
         d = filedialog.askdirectory(initialdir=self.outdir.get())
@@ -176,7 +219,14 @@ class App(tk.Tk):
         self.progress["value"] = 0
         self.worker = threading.Thread(
             target=self._download,
-            args=(urls, outdir, self.quality.get(), self.subfolders.get(), self.use_archive.get()),
+            args=(
+                urls,
+                outdir,
+                self.quality.get(),
+                self.subfolders.get(),
+                self.use_archive.get(),
+                self.use_cookies.get(),
+            ),
             daemon=True,
         )
         self.worker.start()
@@ -185,7 +235,7 @@ class App(tk.Tk):
         self.cancel.set()
         self.status.set("Cancelling...")
 
-    def _download(self, urls, outdir, quality, subfolders, archive):
+    def _download(self, urls, outdir, quality, subfolders, archive, use_cookies):
         def hook(d):
             if self.cancel.is_set():
                 raise Cancelled()
@@ -227,6 +277,9 @@ class App(tk.Tk):
         if archive:
             opts["download_archive"] = os.path.join(outdir, "downloaded.txt")
 
+        if use_cookies and os.path.exists(COOKIES_FILE):
+            opts["cookiefile"] = COOKIES_FILE
+
         ffmpeg_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
         if os.path.exists(os.path.join(APP_DIR, ffmpeg_name)):
             opts["ffmpeg_location"] = APP_DIR
@@ -241,6 +294,23 @@ class App(tk.Tk):
             self.q.put(("log", f"ERROR: {e}"))
             self.q.put(("done", "Stopped because of an error"))
 
+    def _export_cookies(self):
+        browser = self.browser.get()
+        self.btn_cookies.configure(state="disabled")
+        self._log(f"Exporting cookies from {browser}... (if it fails, close the browser and retry)")
+        threading.Thread(target=self._export_cookies_worker, args=(browser,), daemon=True).start()
+
+    def _export_cookies_worker(self, browser):
+        try:
+            os.makedirs(os.path.dirname(COOKIES_FILE), exist_ok=True)
+            opts = {"cookiesfrombrowser": (browser,), "quiet": True, "logger": QueueLogger(self.q)}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.cookiejar.save(COOKIES_FILE, ignore_discard=True, ignore_expires=True)
+                count = len(ydl.cookiejar)
+            self.q.put(("cookies_ok", count))
+        except Exception as e:  # noqa: BLE001
+            self.q.put(("cookies_fail", str(e)))
+
     # ---------- queue polling ----------
     def _poll(self):
         try:
@@ -251,6 +321,15 @@ class App(tk.Tk):
                 elif kind == "progress":
                     self.progress["value"] = data[0]
                     self.status.set(data[1])
+                elif kind == "cookies_ok":
+                    self.btn_cookies.configure(state="normal")
+                    self.use_cookies.set(True)
+                    self._log(f"Exported {data[0]} cookies to {COOKIES_FILE}")
+                    self.status.set("Cookies exported")
+                elif kind == "cookies_fail":
+                    self.btn_cookies.configure(state="normal")
+                    self._log(f"ERROR exporting cookies: {data[0]}")
+                    self.status.set("Cookie export failed")
                 elif kind == "done":
                     self.status.set(data[0])
                     self._log(data[0])
